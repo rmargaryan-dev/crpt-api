@@ -2,12 +2,15 @@ package com.testApi;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.ObjectOutputStream;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.util.Base64;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Properties;
@@ -16,28 +19,16 @@ import java.util.concurrent.TimeUnit;
 
 public class CrptApi {
 
-    private static final String API_URL = "https://ismp.crpt.ru/api/v3/lk/documents/create";
+    private static final Properties PROPERTIES = getProperties("application.properties");
+    // getting token and url from application.properties
+    private static final String API_URL = PROPERTIES.getProperty("api.url");
+    private static final String TOKEN = PROPERTIES.getProperty("auth.token");
     private final Semaphore semaphore;
     private final HttpClient httpClient;
-    private String token;
 
     public CrptApi(TimeUnit timeUnit, int requestLimit) {
         this.semaphore = new Semaphore(requestLimit);
         this.httpClient = HttpClient.newHttpClient();
-
-        Properties properties = new Properties();
-        try (InputStream input = getClass().getClassLoader().getResourceAsStream("application.properties")) {
-            if (input == null) {
-                System.out.println("Sorry, unable to find application.properties");
-                this.token = "";
-            }
-            properties.load(input);
-
-            this.token = properties.getProperty("auth.token");
-
-        } catch (IOException ex) {
-            System.out.println("Sorry, unable to find application.properties");
-        }
 
         long intervalMillis = timeUnit.toMillis(1);
         Thread refillThread = new Thread(() -> {
@@ -55,34 +46,89 @@ public class CrptApi {
         refillThread.start();
     }
 
+    public static Properties getProperties(String path) {
+        Properties properties = new Properties();
+        try (InputStream input = CrptApi.class.getClassLoader().getResourceAsStream(path)) {
+            if (input == null) {
+                System.out.println("Sorry, unable to find application.properties");
+                return new Properties();
+            }
+            properties.load(input);
+
+            return properties;
+
+        } catch (IOException ex) {
+            System.out.println("Sorry, unable to find application.properties");
+            return new Properties();
+        }
+    }
+
     public void createDocument(Object document, String signature) throws InterruptedException {
         semaphore.acquire();
 
         try {
             ObjectMapper objectMapper = new ObjectMapper();
             Map<String, Object> requestBody = new HashMap<>();
+            Map documentMap = objectMapper.convertValue(document, Map.class);
 
-            requestBody.put("product_document", document);
-            requestBody.put("document_format", "MANUAL");
+            requestBody.put("product_document", encodeObjectToBase64(document));
+            requestBody.put("document_format", DocumentType.MANUAL.getIdentifier());
+            requestBody.put("type", documentMap.get("doc_type"));
+            // signature is already base64
             requestBody.put("signature", signature);
 
             String jsonRequestBody = objectMapper.writeValueAsString(requestBody);
+
             HttpRequest request = HttpRequest.newBuilder()
                     .uri(URI.create(API_URL))
                     .header("Content-Type", "application/json")
-                    .header("Authorization", "Bearer " + token)
+                    .header("Authorization", "Bearer " + TOKEN)
                     .POST(HttpRequest.BodyPublishers.ofString(jsonRequestBody))
                     .build();
 
             HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
             if (response.statusCode() != 200) {
-                throw new RuntimeException("Failed to create document: " + response.body());
+                System.out.println("Failed to create document:\n" + response.body());
             }
 
         } catch (IOException | InterruptedException e) {
-            throw new RuntimeException("Error processing document", e);
+            System.out.println("Error processing document\n" + e.getMessage());
         } finally {
             semaphore.release();
+        }
+    }
+
+    public String encodeObjectToBase64(Object obj) {
+        String base64EncodedString = null;
+        try (ByteArrayOutputStream byteArrayOutputStream = new ByteArrayOutputStream();
+             ObjectOutputStream objectOutputStream = new ObjectOutputStream(byteArrayOutputStream)) {
+
+            objectOutputStream.writeObject(obj);
+            objectOutputStream.flush();
+
+            byte[] objectBytes = byteArrayOutputStream.toByteArray();
+            base64EncodedString = Base64.getEncoder().encodeToString(objectBytes);
+
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+
+        return base64EncodedString;
+    }
+
+    private enum DocumentType {
+        MANUAL("MANUAL"),
+        XML("XML"),
+        CSV("CSV");
+
+        private final String identifier;
+
+        DocumentType(String identifier) {
+            this.identifier = identifier;
+        }
+
+        public String getIdentifier() {
+            return identifier;
         }
     }
 }
